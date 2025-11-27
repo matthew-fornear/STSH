@@ -14,6 +14,12 @@ ENV/
 my_music/
 downloads/
 
+# Logs
+log/
+
+# Temporary files
+temp_art/
+
 # User data
 *.csv
 Liked_Songs.csv
