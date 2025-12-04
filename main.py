@@ -3,6 +3,8 @@ import csv
 import os
 import glob
 import time
+import subprocess
+import urllib.parse
 import requests
 from datetime import datetime
 from yt_dlp import YoutubeDL
@@ -91,6 +93,70 @@ def tag_mp3(file_path, track_name, artist_name, album_name, release_date, album_
         print(f"  Warning: Could not tag MP3: {e}")
         return False
 
+def fetch_album_art_from_musicbrainz(track_name, artist_name, album_name):
+    """Fetch album art from MusicBrainz Cover Art Archive."""
+    try:
+        # Try MusicBrainz Cover Art Archive (no API key needed)
+        # Search format: release=album&artist=artist works better than query=
+        search_album = album_name if album_name else track_name
+        mb_search_url = f"https://musicbrainz.org/ws/2/release/?query=release:{urllib.parse.quote(search_album)}&artist={urllib.parse.quote(artist_name)}&fmt=json&limit=1"
+        
+        headers = {'User-Agent': 'STSH/1.0 (https://github.com/user/stsh)'}
+        response = requests.get(mb_search_url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'releases' in data and len(data['releases']) > 0:
+                release_id = data['releases'][0].get('id')
+                if release_id:
+                    # Get cover art from Cover Art Archive (try front-250 first, then front)
+                    for size in ['front-250', 'front']:
+                        cover_url = f"https://coverartarchive.org/release/{release_id}/{size}"
+                        cover_response = requests.head(cover_url, allow_redirects=True, timeout=10)
+                        if cover_response.status_code == 200:
+                            return cover_response.url
+        
+        return None
+    except Exception as e:
+        return None
+
+def embed_art_with_beets(file_path, track_name, artist_name, album_name):
+    """Fetch and embed album art using external APIs."""
+    try:
+        # Fetch album art from Last.fm
+        art_url = fetch_album_art_from_musicbrainz(track_name, artist_name, album_name)
+        if art_url:
+            # Download and embed the art
+            art_path = download_album_art(art_url)
+            if art_path:
+                # Read the MP3 file
+                audio = MP3(file_path, ID3=ID3)
+                if audio.tags is None:
+                    audio.add_tags()
+                
+                # Embed the art
+                with open(art_path, 'rb') as f:
+                    art_data = f.read()
+                    mime_type = 'image/jpeg' if art_path.endswith('.jpg') else 'image/png'
+                    audio.tags.add(APIC(
+                        encoding=3,
+                        mime=mime_type,
+                        type=3,
+                        desc='Cover',
+                        data=art_data
+                    ))
+                audio.save()
+                
+                # Clean up
+                try:
+                    os.remove(art_path)
+                except:
+                    pass
+                return True
+        return False
+    except Exception as e:
+        return False
+
 def find_newest_mp3(output_dir, before_time):
     """Find the most recently created MP3 file after a given time."""
     mp3_files = glob.glob(os.path.join(output_dir, "*.mp3"))
@@ -128,6 +194,8 @@ def download_songs_from_csv(csv_file, output_dir='downloads', log_file=None):
         'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
         'quiet': False,
         'no_warnings': False,
+        'noplaylist': True,  # Don't download playlists
+        'extract_flat': False,  # Always extract full info for proper titles
     }
     
     # Read CSV and download each track
@@ -166,30 +234,122 @@ def download_songs_from_csv(csv_file, output_dir='downloads', log_file=None):
             before_time = time.time()
             
             try:
+                # First, extract video info to validate it's the correct track
+                with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                    search_results = ydl.extract_info(f"ytsearch5:{search_query}", download=False)
+                    if not search_results or 'entries' not in search_results or not search_results['entries']:
+                        msg = f"✗ No results found for: {track_name} - {artist_name}"
+                        print(msg)
+                        if log_file:
+                            log_file.write(f"{datetime.now().isoformat()} - {msg}\n")
+                        continue
+                    
+                    # Find the best matching result with stricter validation
+                    best_match = None
+                    track_lower = track_name.lower()
+                    artist_lower = artist_name.lower()
+                    
+                    # Split artist names (handle multiple artists)
+                    artist_parts = [a.strip().lower() for a in artist_lower.split(';')]
+                    artist_parts.extend([a.strip().lower() for a in artist_lower.split(',')])
+                    
+                    for entry in search_results['entries']:
+                        if not entry:
+                            continue
+                        title = entry.get('title', '').lower()
+                        video_id = entry.get('id')
+                        duration = entry.get('duration', 0)  # Duration in seconds
+                        
+                        # Skip if title contains loop/extended versions or generic content
+                        skip_keywords = [
+                            'coins for free', 'shorts', 'videoplayback', 'talking tom',
+                            'loop', '1 hour', '10 hour', 'hour loop', '[1 hour',
+                            'extended', 'nightcore', 'slowed', 'reverb', 'sped up',
+                            'slowed down', 'remix', 'mashup', 'cover', 'live at'
+                        ]
+                        if any(keyword in title for keyword in skip_keywords):
+                            continue
+                        
+                        # Skip videos that are too long (likely loops/extended) or too short (likely clips)
+                        # Normal songs are typically 2-10 minutes (120-600 seconds)
+                        if duration > 0:
+                            if duration > 600 or duration < 60:  # Skip if >10min or <1min
+                                continue
+                        
+                        # Check if track name appears in title
+                        track_in_title = track_lower in title
+                        
+                        # Check if at least one artist name appears in title
+                        artist_in_title = any(artist_part in title for artist_part in artist_parts if len(artist_part) > 2)
+                        
+                        # Require both track AND artist to match
+                        if track_in_title and artist_in_title:
+                            best_match = entry
+                            break
+                    
+                    # If no good match found, skip this track
+                    if not best_match:
+                        first_title = search_results['entries'][0].get('title', 'Unknown') if search_results['entries'] else 'Unknown'
+                        msg = f"✗ No good match found. First result: '{first_title}' - skipping"
+                        print(f"  {msg}")
+                        if log_file:
+                            log_file.write(f"{datetime.now().isoformat()} - {msg}\n")
+                        continue
+                    
+                    # Always use YouTube watch URL format (not direct video URLs)
+                    video_id = best_match.get('id')
+                    if not video_id:
+                        msg = f"✗ Could not get video ID for: {track_name} - {artist_name}"
+                        print(f"  {msg}")
+                        if log_file:
+                            log_file.write(f"{datetime.now().isoformat()} - {msg}\n")
+                        continue
+                    
+                    video_url = f"https://www.youtube.com/watch?v={video_id}"
+                
+                # Now download the validated video
                 with YoutubeDL(ydl_opts) as ydl:
-                    # Search YouTube and download first result
-                    ydl.download([f"ytsearch1:{search_query}"])
+                    ydl.download([video_url])
                 
                 # Find the newly downloaded file
                 downloaded_file = find_newest_mp3(output_dir, before_time)
                 
                 if downloaded_file:
-                    # Download album art
-                    album_art_path = None
-                    if album_image_url:
-                        print(f"  Downloading album art...")
-                        album_art_path = download_album_art(album_image_url)
-                    
-                    # Tag the MP3 file
-                    print(f"  Adding metadata tags...")
-                    tag_mp3(downloaded_file, track_name, artist_name, album_name, release_date, album_art_path)
-                    
-                    # Clean up temporary album art
-                    if album_art_path and os.path.exists(album_art_path):
+                    # Check if filename is generic (bad download)
+                    filename = os.path.basename(downloaded_file).lower()
+                    if 'videoplayback' in filename or filename == 'videoplayback.mp3':
+                        # Delete bad download and skip
                         try:
-                            os.remove(album_art_path)
+                            os.remove(downloaded_file)
+                            msg = f"✗ Bad download detected (generic filename) - deleted and skipped: {track_name} - {artist_name}"
+                            print(f"  {msg}")
+                            if log_file:
+                                log_file.write(f"{datetime.now().isoformat()} - {msg}\n")
+                            continue
                         except:
                             pass
+                    # Tag the MP3 file with metadata first
+                    print(f"  Adding metadata tags...")
+                    tag_mp3(downloaded_file, track_name, artist_name, album_name, release_date)
+                    
+                    # Try to get album art from CSV first
+                    album_art_path = None
+                    if album_image_url:
+                        print(f"  Downloading album art from CSV...")
+                        album_art_path = download_album_art(album_image_url)
+                        if album_art_path:
+                            # Embed CSV album art
+                            tag_mp3(downloaded_file, track_name, artist_name, album_name, release_date, album_art_path)
+                            # Clean up temporary album art
+                            try:
+                                os.remove(album_art_path)
+                            except:
+                                pass
+                    
+                    # Use beets to fetch and embed album art (if CSV art wasn't available or as fallback)
+                    if not album_art_path:
+                        print(f"  Fetching album art...")
+                        embed_art_with_beets(downloaded_file, track_name, artist_name, album_name)
                     
                     msg = f"✓ Downloaded and tagged: {track_name} - {artist_name}"
                 else:
